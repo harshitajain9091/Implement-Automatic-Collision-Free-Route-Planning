@@ -1,0 +1,10 @@
+4) Submission checklist (mapped to the prompt)
+Level 1 video: Run python agent.py --level 1. Record 4 attempts with the goal placed in different corners (change CONFIG.GOAL_WORLD or move the in-sim goal). Include the average collisions (from logs or sim telemetry).
+Level 2 video: Run python agent.py --level 2 while enabling moving obstacles in the sim (as instructed). Record 4 attempts, each to a different corner.
+Level 3 graph: After several Level-2 runs, run python agent.py --plot. Upload runs/speed_vs_collisions.png.
+Repo: Commit agent.py, runs/ (with logs + plot), and a short README with run instructions. Keep repo private; add collaborators per the prompt.
+5) Tuning tips (fast)
+If the bot hugs obstacles: increase DILATION_PX or PREDICT_INFLATE.
+If no path occasionally: set GRID_DOWNSAMPLE=1 (higher resolution) or lower it to speed up.
+Colors off? Press p in your sim (if supported) or temporarily print HSV values under your lighting and tweak HSV_* ranges.
+If your sim exposes exact robot pose in /state, you can ignore HSV_ROBOT and directly use that for robot_xy (convert world→pixels with a scale).
