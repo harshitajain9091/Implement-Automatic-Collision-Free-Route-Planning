@@ -1,0 +1,27 @@
+1) How to use
+Install deps (inside the sim’s venv, or system Python 3.9+):
+pip install opencv-python numpy requests websockets scipy
+
+
+Put the file below as agent.py in the same project where the simulator runs.
+
+Start the simulator per README (Flask + WebSocket must be running).
+Note the base URL (e.g., http://127.0.0.1:5000) and the WS URL if you have one.
+
+Set the config block at the top of agent.py:
+
+BASE_HTTP – your Flask base (e.g. http://localhost:5000)
+endpoint paths if they differ (some repos use /move, some /move_rel)
+choose a goal in world units (e.g. one of the four corners)
+Run:
+python agent.py --level 1         # static obstacles
+python agent.py --level 2         # moving obstacles (replans & predicts)
+Record your screen (OBS or built-in recorder) to produce the required videos.
+After runs, check runs/ for logs; use the included plotting command:
+python agent.py --plot
+2) What the agent does (quick)
+Perception (from /capture): thresholds colors to find green blocks (obstacles), red target, and the bot. Builds a binary occupancy grid, dilated for safety.
+Planning: A* on the grid to the current goal; converts the path to small relative moves.
+Control: sends /move_rel (or /move) commands until the goal tolerance is reached.
+Dynamic obstacles (Level 2): tracks obstacle centroids frame-to-frame, estimates velocity, predicts near-future occupancy, and replans every step to avoid predicted collisions.
+Metrics: counts collisions (if exposed by sim API; otherwise estimates via contact proximity on the grid), computes obstacle speeds, and saves CSV for Level 3 graph.
