@@ -1,0 +1,458 @@
+3) The code (single file)
+Paste this as agent.py. If your endpoints or color palette differ, adjust the CONFIG section comments.
+
+#!/usr/bin/env python3
+"""
+Autonomous, vision-only route planner for the Sim-1 task.
+
+Features
+- Level 1: static obstacles -> A* on occupancy grid from /capture frames.
+- Level 2: moving obstacles -> online replanning + naïve motion prediction.
+- Logs obstacle speeds & collisions for Level 3 graph.
+"""
+
+import argparse, os, time, math, json, csv, io
+from dataclasses import dataclass
+from typing import Tuple, List, Optional, Dict
+import numpy as np
+import requests
+import cv2
+from scipy.ndimage import binary_dilation
+
+# =========================
+# CONFIG — ADJUST TO SIM
+# =========================
+class CONFIG:
+    # Base HTTP of your Flask server:
+    BASE_HTTP = "http://127.0.0.1:5000"
+
+    # Endpoints (change if your repo uses different paths/names):
+    CAPTURE_EP = "/capture"      # returns the latest RGB frame (PNG/JPEG bytes)
+    MOVE_REL_EP = "/move_rel"    # accepts JSON {"dx": float, "dy": float}
+    MOVE_ABS_EP = "/move"        # optional, accepts {"x": float, "y": float}
+    RESET_EP = "/reset"          # optional; reset environment/robot
+    TELEMETRY_EP = "/state"      # optional; position, collisions, etc.
+
+    # Coordinate system and scaling:
+    # If the sim's world units match pixels, set SCALE=1.0.
+    # Otherwise, we map image pixels -> world with this scalar.
+    SCALE = 1.0
+
+    # Goal position (world units). Put a corner here for Level 1 requirement.
+    # You can swap corners across attempts: (x_min,y_min), (x_min,y_max), ...
+    GOAL_WORLD = (900, 900)  # example; change to a top-right corner in your sim
+
+    # Vision thresholds (HSV) for GREEN blocks, RED goal, and ROBOT marker.
+    # Tune these ranges by printing live values under your sim lighting.
+    HSV_GREEN = ((35, 40, 40), (85, 255, 255))      # green obstacles
+    HSV_RED1  = ((0, 70, 50),  (10, 255, 255))      # red (lower)
+    HSV_RED2  = ((170, 70, 50),(180, 255, 255))     # red (upper)
+    HSV_ROBOT = ((0, 0, 200),  (180, 30, 255))      # bright/white marker (example)
+
+    # Grid + planner params:
+    GRID_DOWNSAMPLE = 2         # 1 = full-res; 2 halves both dims
+    DILATION_PX = 6             # safety inflation (pre-downsample)
+    STEP_PX = 8                 # relative step size (in pixels) per command
+    GOAL_TOL_PX = 12            # stop when robot is this close (pixels)
+    REPLAN_EVERY_STEP = True    # recompute A* at each move (robust for L2)
+    MAX_STEPS = 3000
+
+    # Moving obstacle prediction (Level 2):
+    PREDICT_HORIZON = 0.4       # seconds
+    PREDICT_INFLATE = 10        # px inflation for predicted positions
+
+    # Logging
+    RUNS_DIR = "runs"
+
+# =========================
+# HTTP helpers
+# =========================
+def http_get_img() -> Optional[np.ndarray]:
+    """Fetch image bytes from /capture and decode to BGR ndarray."""
+    url = CONFIG.BASE_HTTP + CONFIG.CAPTURE_EP
+    r = requests.get(url, timeout=3)
+    if r.status_code != 200:
+        return None
+    img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+    return img
+
+def http_post_json(ep: str, payload: Dict) -> Dict:
+    url = CONFIG.BASE_HTTP + ep
+    r = requests.post(url, json=payload, timeout=3)
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": r.ok, "status": r.status_code, "text": r.text}
+
+def move_rel(dx: float, dy: float) -> Dict:
+    return http_post_json(CONFIG.MOVE_REL_EP, {"dx": float(dx), "dy": float(dy)})
+
+def move_abs(x: float, y: float) -> Dict:
+    return http_post_json(CONFIG.MOVE_ABS_EP, {"x": float(x), "y": float(y)})
+
+def reset_env():
+    try:
+        http_post_json(CONFIG.RESET_EP, {})
+    except Exception:
+        pass
+
+def get_state() -> Dict:
+    try:
+        return requests.get(CONFIG.BASE_HTTP + CONFIG.TELEMETRY_EP, timeout=2).json()
+    except Exception:
+        return {}
+
+# =========================
+# Vision: masks & detections
+# =========================
+@dataclass
+class Dets:
+    robot_xy: Optional[Tuple[int,int]]
+    goal_xy: Optional[Tuple[int,int]]
+    obstacle_mask: np.ndarray  # binary mask (uint8 0/255)
+    ts: float
+
+class Vision:
+    def __init__(self):
+        self.prev_obs_centroids: Dict[int, Tuple[float,float]] = {}
+        self.prev_time: Optional[float] = None
+        self.id_counter = 0
+
+    @staticmethod
+    def _mask_hsv(hsv, lo, hi):
+        lo = np.array(lo, dtype=np.uint8)
+        hi = np.array(hi, dtype=np.uint8)
+        return cv2.inRange(hsv, lo, hi)
+
+    def detect(self, bgr: np.ndarray) -> Dets:
+        ts = time.time()
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+        green = self._mask_hsv(hsv, *CONFIG.HSV_GREEN)
+        red1  = self._mask_hsv(hsv, *CONFIG.HSV_RED1)
+        red2  = self._mask_hsv(hsv, *CONFIG.HSV_RED2)
+        red = cv2.bitwise_or(red1, red2)
+        robot = self._mask_hsv(hsv, *CONFIG.HSV_ROBOT)
+
+        # Postprocess
+        kernel = np.ones((3,3), np.uint8)
+        green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, kernel, iterations=2)
+        red   = cv2.morphologyEx(red,   cv2.MORPH_CLOSE, kernel, iterations=2)
+        robot = cv2.morphologyEx(robot, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # obstacle mask (dilated for safety)
+        if CONFIG.DILATION_PX > 0:
+            k = np.ones((CONFIG.DILATION_PX, CONFIG.DILATION_PX), np.uint8)
+            green_inflated = cv2.dilate(green, k, iterations=1)
+        else:
+            green_inflated = green
+
+        # centroids
+        def centroid(mask) -> Optional[Tuple[int,int]]:
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                return None
+            c = max(cnts, key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M["m00"] == 0: 
+                x,y,w,h = cv2.boundingRect(c)
+                return (x+w//2, y+h//2)
+            return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
+
+        robot_xy = centroid(robot)
+        goal_xy  = centroid(red)
+
+        return Dets(robot_xy, goal_xy, green_inflated, ts)
+
+    # Simple blob tracker to estimate mean obstacle speed for Level 3
+    def obstacle_speeds(self, mask_curr: np.ndarray, dt: float) -> List[float]:
+        # label blobs
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_curr, connectivity=8)
+        # skip background label 0
+        cents = [tuple(map(float, c)) for c in centroids[1:]]
+        if self.prev_time is None:
+            self.prev_obs_centroids = {i: cents[i] for i in range(len(cents))}
+            self.prev_time = time.time()
+            return []
+
+        speeds = []
+        # greedy match by nearest neighbor
+        prev = self.prev_obs_centroids
+        used = set()
+        for i, c in enumerate(cents):
+            # find nearest previous
+            pid, pd = None, 1e9
+            for k, pc in prev.items():
+                if k in used: continue
+                d = math.hypot(c[0]-pc[0], c[1]-pc[1])
+                if d < pd:
+                    pd, pid = d, k
+            if pid is None:
+                # new id
+                nid = max(prev.keys(), default=-1) + 1
+                prev[nid] = c
+                continue
+            v = pd / max(dt, 1e-3)  # px/s
+            speeds.append(v)
+            prev[pid] = c
+            used.add(pid)
+
+        self.prev_obs_centroids = prev
+        self.prev_time = time.time()
+        return speeds
+
+# =========================
+# Grid & A* planner
+# =========================
+def build_grid(img_shape, obstacle_mask) -> np.ndarray:
+    """Build a 0/1 grid (1=free, 0=blocked), possibly downsampled."""
+    H, W = img_shape[:2]
+    ds = CONFIG.GRID_DOWNSAMPLE
+    obs_small = cv2.resize(obstacle_mask, (W//ds, H//ds), interpolation=cv2.INTER_AREA)
+    occ = (obs_small > 0).astype(np.uint8)
+    free = (1 - occ).astype(np.uint8)
+    return free  # 1 = free, 0 = blocked
+
+def astar(grid: np.ndarray, start_xy: Tuple[int,int], goal_xy: Tuple[int,int]) -> Optional[List[Tuple[int,int]]]:
+    H, W = grid.shape
+    sx, sy = start_xy
+    gx, gy = goal_xy
+    # bounds clamp
+    sx = int(np.clip(sx, 0, W-1)); sy = int(np.clip(sy, 0, H-1))
+    gx = int(np.clip(gx, 0, W-1)); gy = int(np.clip(gy, 0, H-1))
+
+    if grid[sy, sx] == 0 or grid[gy, gx] == 0:
+        return None
+
+    import heapq
+    openh = []
+    heapq.heappush(openh, (0, (sx,sy)))
+    came = {}
+    g = {(sx,sy): 0}
+    def h(x,y): return abs(x-gx) + abs(y-gy)
+
+    while openh:
+        _, (x,y) = heapq.heappop(openh)
+        if (x,y) == (gx,gy):
+            # reconstruct
+            path = [(x,y)]
+            while (x,y) in came:
+                x,y = came[(x,y)]
+                path.append((x,y))
+            path.reverse()
+            return path
+        for dx,dy in [(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(1,-1),(-1,-1)]:
+            nx, ny = x+dx, y+dy
+            if nx<0 or ny<0 or nx>=W or ny>=H: continue
+            if grid[ny, nx] == 0: continue
+            cost = g[(x,y)] + (1.4 if dx!=0 and dy!=0 else 1.0)
+            if (nx,ny) not in g or cost < g[(nx,ny)]:
+                g[(nx,ny)] = cost
+                came[(nx,ny)] = (x,y)
+                heapq.heappush(openh, (cost + h(nx,ny), (nx,ny)))
+    return None
+
+# =========================
+# Controller
+# =========================
+def pixel_to_grid(pxy: Tuple[int,int], img_shape) -> Tuple[int,int]:
+    ds = CONFIG.GRID_DOWNSAMPLE
+    return (pxy[0]//ds, pxy[1]//ds)
+
+def grid_to_pixel(gxy: Tuple[int,int]) -> Tuple[int,int]:
+    ds = CONFIG.GRID_DOWNSAMPLE
+    return (gxy[0]*ds, gxy[1]*ds)
+
+def step_towards(curr_px: Tuple[int,int], next_px: Tuple[int,int]) -> Tuple[float,float]:
+    """Return a clipped (dx, dy) in pixel space."""
+    dx = next_px[0] - curr_px[0]
+    dy = next_px[1] - curr_px[1]
+    d = math.hypot(dx, dy)
+    if d < 1e-6: 
+        return (0.0, 0.0)
+    s = CONFIG.STEP_PX / d
+    if d <= CONFIG.STEP_PX:
+        s = 1.0
+    return (dx*s, dy*s)
+
+# =========================
+# Run loop
+# =========================
+def run(level: int):
+    os.makedirs(CONFIG.RUNS_DIR, exist_ok=True)
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    log_csv = os.path.join(CONFIG.RUNS_DIR, f"log_{run_id}_L{level}.csv")
+    with open(log_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t", "rx", "ry", "gx", "gy", "mean_obs_speed_px_s", "collisions"])
+
+    vision = Vision()
+    reset_env()
+    time.sleep(0.3)
+
+    collisions_est = 0
+    last_det: Optional[Dets] = None
+    last_img_shape = None
+
+    for step in range(CONFIG.MAX_STEPS):
+        img = http_get_img()
+        if img is None:
+            print("No image from /capture; check server.")
+            break
+
+        last_img_shape = img.shape
+        det = vision.detect(img)
+        last_det = det
+
+        # choose goal: either detected red center or configured corner in pixel space
+        if det.goal_xy is not None:
+            goal_px = det.goal_xy
+        else:
+            # use configured world goal; here we treat it as pixels
+            goal_px = (int(CONFIG.GOAL_WORLD[0]), int(CONFIG.GOAL_WORLD[1]))
+            goal_px = (min(max(0, goal_px[0]), img.shape[1]-1),
+                       min(max(0, goal_px[1]), img.shape[0]-1))
+
+        if det.robot_xy is None:
+            print("Robot not visible; waiting...")
+            time.sleep(0.05)
+            continue
+
+        # estimate obstacle speeds for Level 3
+        mean_speed = 0.0
+        if step > 0:
+            dt = det.ts - prev_ts
+            speeds = vision.obstacle_speeds(det.obstacle_mask, dt)
+            if len(speeds) > 0:
+                mean_speed = float(np.mean(speeds))
+
+        # Predict moving obstacles occupancy (Level 2)
+        obstacle_mask = det.obstacle_mask.copy()
+        if level >= 2 and step > 0:
+            # simple prediction: expand current mask to where blobs will move in horizon
+            dt_pred = CONFIG.PREDICT_HORIZON
+            # we already computed speeds; we don't have directions per-blob without persistent IDs here,
+            # so we use a conservative inflation to emulate "where it could be".
+            k = np.ones((CONFIG.PREDICT_INFLATE, CONFIG.PREDICT_INFLATE), np.uint8)
+            obstacle_mask = cv2.dilate(obstacle_mask, k, iterations=1)
+
+        grid = build_grid(img.shape, obstacle_mask)
+        r_g = pixel_to_grid(det.robot_xy, img.shape)
+        g_g = pixel_to_grid(goal_px, img.shape)
+
+        path = astar(grid, r_g, g_g)
+        if not path or len(path) < 2:
+            # no path -> try slight extra inflation fallback removed
+            print("No path; attempting small jitter move to escape.")
+            # escape: random small nudge
+            jitter = np.random.uniform(-1, 1, size=2)
+            dx, dy = jitter[0]*CONFIG.STEP_PX, jitter[1]*CONFIG.STEP_PX
+            move_rel(dx, dy)
+            prev_ts = det.ts
+            time.sleep(0.02)
+            continue
+
+        # next waypoint (in pixel space)
+        nxt_grid = path[1]
+        nxt_px = grid_to_pixel(nxt_grid)
+        dx_px, dy_px = step_towards(det.robot_xy, nxt_px)
+
+        # crude proximity-based collision estimate: if the intended next point is within inflated obstacle
+        nx_int, ny_int = int(det.robot_xy[0] + dx_px), int(det.robot_xy[1] + dy_px)
+        nx_int = np.clip(nx_int, 0, img.shape[1]-1)
+        ny_int = np.clip(ny_int, 0, img.shape[0]-1)
+        if det.obstacle_mask[ny_int, nx_int] > 0:
+            collisions_est += 1
+
+        # Execute move (convert pixel delta to sim delta if needed)
+        dx_world = dx_px / CONFIG.SCALE
+        dy_world = dy_px / CONFIG.SCALE
+        move_rel(dx_world, dy_world)
+
+        # log
+        st = get_state()
+        collisions_true = st.get("collisions", collisions_est)
+        with open(log_csv, "a", newline="") as f:
+            csv.writer(f).writerow([
+                f"{det.ts:.3f}",
+                det.robot_xy[0], det.robot_xy[1],
+                goal_px[0], goal_px[1],
+                f"{mean_speed:.3f}",
+                collisions_true
+            ])
+
+        # done?
+        if math.hypot(det.robot_xy[0]-goal_px[0], det.robot_xy[1]-goal_px[1]) <= CONFIG.GOAL_TOL_PX:
+            print(f"Reached goal in {step+1} steps.")
+            break
+
+        prev_ts = det.ts
+        time.sleep(0.02)
+
+    print("Run finished. Log:", log_csv)
+
+# =========================
+# Plotting for Level 3
+# =========================
+def plot_logs():
+    import glob
+    import matplotlib.pyplot as plt
+
+    files = sorted(glob.glob(os.path.join(CONFIG.RUNS_DIR, "log_*_L*.csv")))
+    if not files:
+        print("No logs found in runs/")
+        return
+    for fp in files:
+        t, v, c = [], [], []
+        with open(fp, "r") as f:
+            rr = list(csv.DictReader(f))
+        for r in rr:
+            t.append(float(r["t"]))
+            v.append(float(r["mean_obs_speed_px_s"]))
+            c.append(int(r["collisions"]))
+        if not t: 
+            continue
+        # compute per-run aggregate: mean obstacle speed vs total collisions
+        mean_v = float(np.mean([x for x in v if x>0])) if any(v) else 0.0
+        total_c = c[-1] if c else 0
+        print(f"{os.path.basename(fp)} -> mean_speed={mean_v:.1f} px/s, collisions={total_c}")
+
+    # Scatter plot across runs (mean speed vs collisions)
+    xs, ys = [], []
+    for fp in files:
+        with open(fp, "r") as f:
+            rr = list(csv.DictReader(f))
+        v = [float(r["mean_obs_speed_px_s"]) for r in rr if float(r["mean_obs_speed_px_s"])>0]
+        c = [int(r["collisions"]) for r in rr]
+        if not v or not c:
+            continue
+        xs.append(float(np.mean(v)))
+        ys.append(int(c[-1]))
+    if xs:
+        plt.figure()
+        plt.scatter(xs, ys)
+        plt.xlabel("Mean obstacle speed (px/s)")
+        plt.ylabel("Collisions (count)")
+        plt.title("Speed vs Collisions")
+        plt.grid(True)
+        out = os.path.join(CONFIG.RUNS_DIR, "speed_vs_collisions.png")
+        plt.savefig(out, dpi=160, bbox_inches="tight")
+        print("Saved plot:", out)
+    else:
+        print("Not enough data to plot.")
+
+# =========================
+# CLI
+# =========================
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--level", type=int, choices=[1,2], help="1=static, 2=moving")
+    ap.add_argument("--plot", action="store_true", help="Plot Level-3 graph from runs/")
+    args = ap.parse_args()
+
+    if args.plot:
+        plot_logs()
+    elif args.level:
+        run(args.level)
+    else:
+        print("Usage:\n  python agent.py --level 1|2\n  python agent.py --plot")
